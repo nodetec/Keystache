@@ -40,6 +40,7 @@ pub enum Message {
         config_invite_code: InviteCode,
     },
 
+    // LoadedNip87Federations(Vec<(InviteCode, ClientConfig)>),
     JoinFedimintFederation(InviteCode),
     ConnectedToFederation,
 
@@ -202,7 +203,7 @@ impl Page {
         match &self.subroute {
             Subroute::List(list) => list.view(&self.connected_state),
             Subroute::FederationDetails(federation_details) => federation_details.view(),
-            Subroute::Add(add) => add.view(),
+            Subroute::Add(add) => add.view(&self.connected_state),
             Subroute::Send(send) => send.view(),
             Subroute::Receive(receive) => receive.view(),
         }
@@ -442,7 +443,7 @@ pub struct ParsedFederationInviteCodeState {
 }
 
 impl Add {
-    fn view<'a>(&self) -> Column<'a, app::Message> {
+    fn view<'a>(&self, connected_state: &ConnectedState) -> Column<'a, app::Message> {
         let mut container = container("Join Federation")
             .push(
                 text_input("Federation Invite Code", &self.federation_invite_code)
