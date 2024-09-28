@@ -150,6 +150,7 @@ impl Page {
             Message::FailedToLoadFederationConfigFromInviteCode { config_invite_code } => {
                 let Subroute::Add(Add {
                     parsed_federation_invite_code_state_or,
+                    nip_87_data_or,
                     ..
                 }) = &mut self.subroute
                 else {
@@ -167,6 +168,18 @@ impl Page {
                         && matches!(maybe_loading_federation_config, Loadable::Loading)
                     {
                         *maybe_loading_federation_config = Loadable::Failed;
+                    }
+                }
+
+                if let Some(Loadable::Loaded(nip_87_data)) = nip_87_data_or {
+                    for (_, invite_codes) in nip_87_data.values_mut() {
+                        for invite_code in invite_codes {
+                            if invite_code.invite_code == config_invite_code
+                                && invite_code.loadable_federation_config == Loadable::Loading
+                            {
+                                invite_code.loadable_federation_config = Loadable::Failed;
+                            }
+                        }
                     }
                 }
 
