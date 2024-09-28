@@ -66,9 +66,6 @@ impl NostrModule {
             async_stream::stream! {
                 let mut last_state = NostrState::default();
 
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                this.find_federations().await;
-
                 loop {
                     let new_state = this.get_state().await;
                     if new_state != last_state {
@@ -82,9 +79,12 @@ impl NostrModule {
         )
     }
 
-    pub async fn find_federations(&self) {
-        println!("Finding federation recommendations...");
-
+    pub async fn find_federations(
+        &self,
+    ) -> Result<
+        BTreeMap<FederationId, (BTreeSet<PublicKey>, BTreeSet<InviteCode>)>,
+        nostr_sdk::client::Error,
+    > {
         let fedimint_recommendation_events = self
             .client
             .get_events_of(
@@ -94,11 +94,10 @@ impl NostrModule {
                     .custom_tag(SingleLetterTag::lowercase(Alphabet::N), vec!["mainnet"])],
                 EventSource::both(None),
             )
-            .await
-            .unwrap();
+            .await?;
 
-        let mut federations: BTreeMap<FederationId, (BTreeSet<PublicKey>, BTreeSet<InviteCode>)> =
-            BTreeMap::new();
+        let mut federations = BTreeMap::new();
+
         for recommendation_event in &fedimint_recommendation_events {
             for d_tag in recommendation_event.get_tags_content(TagKind::SingleLetter(
                 SingleLetterTag::lowercase(Alphabet::D),
@@ -122,12 +121,9 @@ impl NostrModule {
             }
         }
 
-        println!("{:#?}", federations);
-        println!(
-            "Found {} recommendations for {} federations",
-            fedimint_recommendation_events.len(),
-            federations.len()
-        );
+        federations.retain(|_, (_, invite_codes)| !invite_codes.is_empty());
+
+        Ok(federations)
     }
 
     /// Fetches the current state of the Nostr SDK client.

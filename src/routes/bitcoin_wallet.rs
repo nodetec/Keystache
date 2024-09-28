@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, str::FromStr};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
 use fedimint_core::{
     config::{ClientConfig, FederationId, META_FEDERATION_NAME_KEY},
@@ -6,11 +10,13 @@ use fedimint_core::{
     Amount,
 };
 use iced::{
+    futures::{stream::FuturesUnordered, StreamExt},
     widget::{
         column, container::Style, horizontal_space, row, text_input, Column, Container, Space, Text,
     },
-    Border, Length, Shadow, Task, Theme,
+    Border, Element, Length, Shadow, Task, Theme,
 };
+use nostr_sdk::PublicKey;
 
 use crate::{
     app,
@@ -40,7 +46,8 @@ pub enum Message {
         config_invite_code: InviteCode,
     },
 
-    // LoadedNip87Federations(Vec<(InviteCode, ClientConfig)>),
+    LoadNip87Federations,
+    LoadedNip87Federations(BTreeMap<FederationId, (BTreeSet<PublicKey>, BTreeSet<InviteCode>)>),
     JoinFedimintFederation(InviteCode),
     ConnectedToFederation,
 
@@ -64,6 +71,7 @@ impl Page {
                 let Subroute::Add(Add {
                     federation_invite_code,
                     parsed_federation_invite_code_state_or,
+                    ..
                 }) = &mut self.subroute
                 else {
                     return Task::none();
@@ -78,30 +86,22 @@ impl Page {
                             loadable_federation_config: Loadable::Loading,
                         });
 
-                    Task::perform(
-                        async move {
-                            match fedimint_api_client::download_from_invite_code(&invite_code).await
-                            {
-                                Ok(config) => {
-                                    app::Message::Routes(super::Message::BitcoinWalletPage(
-                                        Message::LoadedFederationConfigFromInviteCode {
-                                            config_invite_code: invite_code,
-                                            config,
-                                        },
-                                    ))
-                                }
-                                // TODO: Include error in message and display it in the UI.
-                                Err(_err) => {
-                                    app::Message::Routes(super::Message::BitcoinWalletPage(
-                                        Message::FailedToLoadFederationConfigFromInviteCode {
-                                            config_invite_code: invite_code,
-                                        },
-                                    ))
-                                }
-                            }
-                        },
-                        |msg| msg,
-                    )
+                    Task::future(async move {
+                        match fedimint_api_client::download_from_invite_code(&invite_code).await {
+                            Ok(config) => app::Message::Routes(super::Message::BitcoinWalletPage(
+                                Message::LoadedFederationConfigFromInviteCode {
+                                    config_invite_code: invite_code,
+                                    config,
+                                },
+                            )),
+                            // TODO: Include error in message and display it in the UI.
+                            Err(_err) => app::Message::Routes(super::Message::BitcoinWalletPage(
+                                Message::FailedToLoadFederationConfigFromInviteCode {
+                                    config_invite_code: invite_code,
+                                },
+                            )),
+                        }
+                    })
                 } else {
                     *parsed_federation_invite_code_state_or = None;
 
@@ -114,6 +114,7 @@ impl Page {
             } => {
                 let Subroute::Add(Add {
                     parsed_federation_invite_code_state_or,
+                    nip_87_data_or,
                     ..
                 }) = &mut self.subroute
                 else {
@@ -127,7 +128,20 @@ impl Page {
                 {
                     // If the invite code has changed since the request was made, ignore the response.
                     if &config_invite_code == invite_code {
-                        *maybe_loading_federation_config = Loadable::Loaded(config);
+                        *maybe_loading_federation_config = Loadable::Loaded(config.clone());
+                    }
+                }
+
+                if let Some(Loadable::Loaded(nip_87_data)) = nip_87_data_or {
+                    for (_, invite_codes) in nip_87_data.values_mut() {
+                        for invite_code in invite_codes {
+                            if invite_code.invite_code == config_invite_code
+                                && invite_code.loadable_federation_config == Loadable::Loading
+                            {
+                                invite_code.loadable_federation_config =
+                                    Loadable::Loaded(config.clone());
+                            }
+                        }
                     }
                 }
 
@@ -157,6 +171,90 @@ impl Page {
                 }
 
                 Task::none()
+            }
+            Message::LoadNip87Federations => {
+                if let Subroute::Add(add_page) = &mut self.subroute {
+                    add_page.nip_87_data_or = Some(Loadable::Loading);
+                }
+
+                let nostr_module = self.connected_state.nostr_module.clone();
+
+                Task::future(async move {
+                    match nostr_module.find_federations().await {
+                        Ok(federations) => app::Message::Routes(super::Message::BitcoinWalletPage(
+                            Message::LoadedNip87Federations(federations),
+                        )),
+                        Err(err) => {
+                            panic!()
+                        }
+                    }
+                })
+            }
+            Message::LoadedNip87Federations(nip_87_data) => {
+                if let Subroute::Add(add_page) = &mut self.subroute {
+                    // Only set the state to loaded if the user requested the data.
+                    // This prevents the data from being displayed if the user
+                    // navigates away from the page and back before the data is loaded.
+                    if matches!(add_page.nip_87_data_or, Some(Loadable::Loading)) {
+                        add_page.nip_87_data_or = Some(Loadable::Loaded(
+                            nip_87_data
+                                .clone()
+                                .into_iter()
+                                .map(|(federation_id, (pubkeys, invite_codes))| {
+                                    (
+                                        federation_id,
+                                        (
+                                            pubkeys,
+                                            invite_codes
+                                                .into_iter()
+                                                .map(|invite_code| {
+                                                    ParsedFederationInviteCodeState {
+                                                        invite_code,
+                                                        loadable_federation_config:
+                                                            Loadable::Loading,
+                                                    }
+                                                })
+                                                .collect(),
+                                        ),
+                                    )
+                                })
+                                .collect(),
+                        ));
+                    }
+                }
+
+                Task::stream(async_stream::stream! {
+                    let mut futures = FuturesUnordered::new();
+
+                    for (_, (_, invite_codes)) in nip_87_data {
+                        if let Some(invite_code) = invite_codes.first().cloned() {
+                            futures.push(async move {
+                                match fedimint_api_client::download_from_invite_code(&invite_code).await {
+                                    Ok(config) => {
+                                        app::Message::Routes(super::Message::BitcoinWalletPage(
+                                            Message::LoadedFederationConfigFromInviteCode {
+                                                config_invite_code: invite_code.clone(),
+                                                config,
+                                            },
+                                        ))
+                                    }
+                                    // TODO: Include error in message and display it in the UI.
+                                    Err(_err) => {
+                                        app::Message::Routes(super::Message::BitcoinWalletPage(
+                                            Message::FailedToLoadFederationConfigFromInviteCode {
+                                                config_invite_code: invite_code.clone(),
+                                            },
+                                        ))
+                                    }
+                                }
+                            });
+                        }
+                    }
+
+                    while let Some(result) = futures.next().await {
+                        yield result;
+                    }
+                })
             }
             Message::JoinFedimintFederation(invite_code) => {
                 let wallet = self.connected_state.wallet.clone();
@@ -231,6 +329,7 @@ impl SubrouteName {
             Self::Add => Subroute::Add(Add {
                 federation_invite_code: String::new(),
                 parsed_federation_invite_code_state_or: None,
+                nip_87_data_or: None,
             }),
             Self::Send => Subroute::Send(send::Page::new(connected_state)),
             Self::Receive => Subroute::Receive(receive::Page::new(connected_state)),
@@ -435,11 +534,29 @@ impl FederationDetails {
 pub struct Add {
     federation_invite_code: String,
     parsed_federation_invite_code_state_or: Option<ParsedFederationInviteCodeState>,
+    nip_87_data_or: Option<
+        Loadable<
+            BTreeMap<FederationId, (BTreeSet<PublicKey>, Vec<ParsedFederationInviteCodeState>)>,
+        >,
+    >,
 }
 
+#[derive(PartialEq, Eq)]
 pub struct ParsedFederationInviteCodeState {
     invite_code: InviteCode,
     loadable_federation_config: Loadable<ClientConfig>,
+}
+
+impl PartialOrd for ParsedFederationInviteCodeState {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ParsedFederationInviteCodeState {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.invite_code.cmp(&other.invite_code)
+    }
 }
 
 impl Add {
@@ -516,6 +633,153 @@ impl Add {
                 }
             }
         }
+
+        let nip_87_view: Element<app::Message> = match &self.nip_87_data_or {
+            None => icon_button(
+                "Find Federations",
+                SvgIcon::Search,
+                PaletteColor::Background,
+            )
+            .on_press(app::Message::Routes(super::Message::BitcoinWalletPage(
+                Message::LoadNip87Federations,
+            )))
+            .into(),
+            Some(Loadable::Loading) => Text::new("Loading...").into(),
+            Some(Loadable::Loaded(federation_data)) => {
+                let mut column = Column::new().spacing(10);
+
+                let mut federation_data_sorted_by_recommendations: Vec<_> = federation_data
+                    .iter()
+                    .map(|(federation_id, (pubkeys, invite_codes))| {
+                        (federation_id, pubkeys, invite_codes)
+                    })
+                    .collect();
+
+                federation_data_sorted_by_recommendations
+                    .sort_by_key(|(_, pubkeys, _)| pubkeys.len());
+                federation_data_sorted_by_recommendations.reverse();
+
+                for (federation_id, pubkeys, invite_codes) in
+                    federation_data_sorted_by_recommendations
+                {
+                    let mut sub_column = Column::new()
+                        .push(Text::new(format!("Federation ID: {federation_id}")))
+                        .push(Text::new(format!("{} recommendations", pubkeys.len())));
+
+                    let mut loading_invite_codes: Vec<&ParsedFederationInviteCodeState> =
+                        Vec::new();
+                    let mut loaded_invite_codes: Vec<&ParsedFederationInviteCodeState> = Vec::new();
+                    let mut errored_invite_codes: Vec<&ParsedFederationInviteCodeState> =
+                        Vec::new();
+                    for invite_code in invite_codes {
+                        match &invite_code.loadable_federation_config {
+                            Loadable::Loading => {
+                                loading_invite_codes.push(invite_code);
+                            }
+                            Loadable::Loaded(_) => {
+                                loaded_invite_codes.push(invite_code);
+                            }
+                            Loadable::Failed => {
+                                errored_invite_codes.push(invite_code);
+                            }
+                        }
+                    }
+
+                    let mut most_progressed_invite_code_or = None;
+                    // The order of priority is errored, loading, loaded.
+                    // This is important because we don't want to consider a
+                    // federation as errored if one of its invite codes is loading, and
+                    // we don't want to consider a federation as loading if one of its
+                    // invite codes has successfully loaded.
+                    if !errored_invite_codes.is_empty() {
+                        most_progressed_invite_code_or = Some(errored_invite_codes[0]);
+                    } else if !loading_invite_codes.is_empty() {
+                        most_progressed_invite_code_or = Some(loading_invite_codes[0]);
+                    } else if !loaded_invite_codes.is_empty() {
+                        most_progressed_invite_code_or = Some(loaded_invite_codes[0]);
+                    }
+
+                    if let Some(most_progressed_invite_code) = most_progressed_invite_code_or {
+                        match &most_progressed_invite_code.loadable_federation_config {
+                            Loadable::Loading => {
+                                sub_column = sub_column.push(Text::new("Loading client config..."));
+                            }
+                            Loadable::Loaded(client_config) => {
+                                sub_column = sub_column
+                                    .push(Text::new("Federation Name").size(25))
+                                    .push(Text::new(
+                                        client_config
+                                            .meta::<String>(META_FEDERATION_NAME_KEY)
+                                            .ok()
+                                            .flatten()
+                                            .unwrap_or_default(),
+                                    ))
+                                    .push(Text::new("Modules").size(25))
+                                    .push(Text::new(
+                                        client_config
+                                            .modules
+                                            .values()
+                                            .map(|module| module.kind().to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(", "),
+                                    ))
+                                    .push(Text::new("Guardians").size(25));
+                                for peer_url in client_config.global.api_endpoints.values() {
+                                    sub_column = sub_column.push(Text::new(format!(
+                                        "{} ({})",
+                                        peer_url.name, peer_url.url
+                                    )));
+                                }
+
+                                sub_column = sub_column.push(
+                                    icon_button(
+                                        "Join Federation",
+                                        SvgIcon::Groups,
+                                        PaletteColor::Primary,
+                                    )
+                                    .on_press(
+                                        app::Message::Routes(super::Message::BitcoinWalletPage(
+                                            Message::JoinFedimintFederation(
+                                                most_progressed_invite_code.invite_code.clone(),
+                                            ),
+                                        )),
+                                    ),
+                                );
+                            }
+                            Loadable::Failed => {
+                                sub_column =
+                                    sub_column.push(Text::new("Failed to load client config"));
+                            }
+                        }
+                    }
+
+                    column = column.push(
+                        Container::new(sub_column)
+                            .padding(10)
+                            .width(Length::Fill)
+                            .style(|theme: &Theme| -> Style {
+                                Style {
+                                    text_color: None,
+                                    background: Some(
+                                        lighten(theme.palette().background, 0.05).into(),
+                                    ),
+                                    border: Border {
+                                        color: iced::Color::WHITE,
+                                        width: 0.0,
+                                        radius: (8.0).into(),
+                                    },
+                                    shadow: Shadow::default(),
+                                }
+                            }),
+                    );
+                }
+
+                column.into()
+            }
+            Some(Loadable::Failed) => Text::new("Failed to load NIP-87 data").into(),
+        };
+
+        container = container.push(nip_87_view);
 
         container = container.push(
             icon_button("Back", SvgIcon::ArrowBack, PaletteColor::Background).on_press(
