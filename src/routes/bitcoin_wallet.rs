@@ -672,6 +672,18 @@ impl Add {
                     .sort_by_key(|(_, pubkeys, _)| pubkeys.len());
                 federation_data_sorted_by_recommendations.reverse();
 
+                // Filter out federations that we're already connected to.
+                if let Loadable::Loaded(connected_federation_views) =
+                    &connected_state.loadable_federation_views
+                {
+                    let connected_federation_ids =
+                        connected_federation_views.keys().collect::<BTreeSet<_>>();
+
+                    federation_data_sorted_by_recommendations.retain(|(federation_id, _, _)| {
+                        !connected_federation_ids.contains(federation_id)
+                    });
+                }
+
                 for (federation_id, pubkeys, invite_codes) in
                     federation_data_sorted_by_recommendations
                 {
