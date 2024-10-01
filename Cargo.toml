@@ -28,11 +28,12 @@ fedimint-ln-client = "0.4.2"
 fedimint-ln-common = "0.4.2"
 fedimint-mint-client = "0.4.2"
 fedimint-rocksdb = "0.4.2"
-iced = { version = "0.13.1", features = [
+iced = { version = "0.13.1", default-features = false, features = [
     "advanced",
     "qr_code",
     "svg",
     "tokio",
+    "wgpu",
 ] }
 libsqlite3-sys = { version = "0.30.1", features = ["bundled-sqlcipher"] }
 lightning-invoice = "0.31.0"
